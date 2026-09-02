@@ -1,0 +1,14 @@
+# 统一换行符：仓库内一律存储 LF，消除跨平台 CRLF/LF 混用造成的 diff 噪音
+# .gitattributes 的优先级高于 core.autocrlf，加了这个就不用改全局配置
+* text=auto eol=lf
+
+# 二进制文件：禁止任何换行符转换，否则会损坏文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.onnx binary
+*.pth binary
+*.pdf binary

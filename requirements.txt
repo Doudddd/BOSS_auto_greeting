@@ -1,0 +1,19 @@
+# BOSS直聘自动打招呼 —— 核心依赖
+#
+# 安装（Python 3.8 ~ 3.12，Windows / macOS / Linux 通用）：
+#     pip install -r requirements.txt
+#
+# 注意：onnxruntime 是 onnxocr-ppocrv5 的 extra 依赖，
+#       只装主包会在 import 阶段报 ModuleNotFoundError，
+#       必须用下面的 [onnx] 扩展语法，或单独 pip install onnxruntime。
+
+# ---- 设备自动化（仅 auto_greeting.py / calibrate.py 需要）----
+# 若只用纯 adb 的脚本（test_one.py / probe_swipe.py / calibrate_adb.py），可不装
+airtest==1.4.3
+
+# ---- 文字识别 ----
+onnxocr-ppocrv5[onnx]==0.0.22
+
+# ---- 图像处理（版本锁定：OpenCV 4.6 与 numpy 1.26 组合已实测）----
+opencv-contrib-python==4.6.0.66
+numpy==1.26.4
