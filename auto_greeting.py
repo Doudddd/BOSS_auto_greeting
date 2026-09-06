@@ -14,6 +14,7 @@ __author__ = "BOSS-Auto-Greeting"
 
 import os
 import random
+import subprocess
 import sys
 import time
 
@@ -29,6 +30,7 @@ from ocr_helper import ENGINE
 # ==================== 全局状态 ====================
 STATS = {"success": 0, "skip": 0, "fail": 0}
 REASONS = {"skip": {}, "fail": {}}
+HIT_DETAIL = {"kw": "", "text": ""}   # 最近一次黑名单命中：关键词与实际匹配到的 OCR 文本
 _consecutive_fail = 0
 _log_dir = ""
 
@@ -90,12 +92,51 @@ def save_shot(screen, tag):
 
 # ==================== 动作 ====================
 def do_swipe_next(w, h):
-    """左滑切换到下一个岗位"""
+    """左滑切换到下一个岗位
+
+    走 adb input swipe，不用 airtest 的 swipe：
+    2026-09-06 实测 airtest 的 maxtouch 注入在 vivo(Android 14) 上不触发切岗
+    （日志里 install_maxtouch skipped），而 adb input swipe 同参数一次就切成功。
+    取不到 adb 路径时退回 airtest swipe。
+    """
     sx, sy = to_px(cfg.SWIPE_START_POS, w, h)
     ex = sx + int(round(w * cfg.SWIPE_DX))
     ey = sy + int(round(h * cfg.SWIPE_DY))
     ex, ey = max(1, min(ex, w - 1)), max(1, min(ey, h - 1))
+
+    if cfg.USE_ADB_SWIPE:
+        adb_path = _adb_path()
+        if adb_path:
+            args = [adb_path]
+            serial = _serial()
+            if serial:
+                args += ["-s", serial]
+            args += ["shell", "input", "swipe",
+                     str(sx), str(sy), str(ex), str(ey),
+                     str(int(cfg.SWIPE_DURATION * 1000))]
+            try:
+                subprocess.run(args, capture_output=True, timeout=30)
+                return
+            except Exception as e:
+                print("  [warn] adb swipe 失败，退回 airtest swipe: %r" % e)
+
     swipe((sx, sy), (ex, ey), duration=cfg.SWIPE_DURATION, steps=cfg.SWIPE_STEPS)
+
+
+def _adb_path():
+    """从 airtest 设备对象里拿 adb 可执行文件路径"""
+    try:
+        from airtest.core.api import G
+        return getattr(getattr(G.DEVICE, "adb", None), "adb_path", None) or None
+    except Exception:
+        return None
+
+
+def _serial():
+    """从 DEVICE_URI 里解析 serial，避免两处重复配置"""
+    uri = cfg.DEVICE_URI or ""
+    tail = uri.split(":///")[-1].strip("/")
+    return tail if tail and not tail.startswith("Android") else ""
 
 
 def wait_leave_detail(timeout):
@@ -127,7 +168,8 @@ def match_blacklist(screen):
     if cfg.FILTER_SCOPE == "full_page":
         rois = [None]
     else:
-        rois = [cfg.ROI_JOB_TITLE, cfg.ROI_COMPANY]
+        # ROI_HR_CARD：公司名可能出现在 HR 卡片（布局随岗位浮动），见 config 注释
+        rois = [cfg.ROI_JOB_TITLE, cfg.ROI_COMPANY, cfg.ROI_HR_CARD]
 
     texts = []
     for roi in rois:
@@ -142,9 +184,27 @@ def match_blacklist(screen):
 
     for kw in cfg.BLACK_KEYWORDS:
         for t in texts:
-            if kw in t:
+            if _kw_hit(kw, t):
+                HIT_DETAIL["kw"], HIT_DETAIL["text"] = kw, t
                 return kw
     return None
+
+
+def _kw_hit(kw, t):
+    """关键词是否命中一段 OCR 文本
+
+    除了精确子串，还做「漏字容错」：OCR 经常把「四方精创」识别成「四精创」
+    （2026-09-06 真实事故：因此误发了 2 次沟通）。对长度 >= FUZZY_MIN_LEN 的
+    关键词，删掉任意一个字符后若仍是子串，也算命中。
+    短词（如「硬件」）不做模糊，删一字变单字会误伤一片。
+    """
+    if kw in t:
+        return True
+    if len(kw) >= cfg.FUZZY_MIN_LEN:
+        for i in range(len(kw)):
+            if (kw[:i] + kw[i + 1:]) in t:
+                return True
+    return False
 
 
 # ==================== 单轮处理 ====================
@@ -153,6 +213,9 @@ def process_one(n, w, h):
     screen = shot()
     if screen is None:
         return "fail", "截图失败"
+
+    # 打印岗位标题：滑动是否真的切换了岗位，一眼可见
+    print("  岗位: %s" % (" / ".join(ENGINE.texts(screen, cfg.ROI_JOB_TITLE)) or "未识别"))
 
     btn_texts = ENGINE.texts(screen, cfg.ROI_BUTTON)
     already = any(cfg.TEXT_ALREADY in t for t in btn_texts)
@@ -171,11 +234,20 @@ def process_one(n, w, h):
         return "skip", "已沟通过（继续沟通）"
 
     # ② 黑名单过滤
+    # 详情页内容（HR 卡片的公司名）可能异步加载：切岗后首次截图里还没有，
+    # 所以未命中时延迟复扫一次再放行，防止漏过滤误发沟通
     hit = match_blacklist(screen)
+    if not hit and cfg.BLACKLIST_RESCAN_DELAY > 0:
+        sleep(cfg.BLACKLIST_RESCAN_DELAY)
+        rescan = shot()
+        if rescan is not None:
+            hit = match_blacklist(rescan)
+            if hit:
+                screen = rescan  # 存证截图用能看见公司名的那张
     if hit:
         if cfg.SAVE_SKIP_SHOT:
             save_shot(screen, "skip_kw_%03d" % n)
-        return "skip", "命中黑名单[%s]" % hit
+        return "skip", "命中黑名单[%s]（匹配文本: %s）" % (hit, HIT_DETAIL["text"] or "-")
 
     # ③ 点击「立即沟通」
     touch(to_px(cfg.BTN_COMMUNICATE_POS, w, h))
@@ -212,6 +284,23 @@ def parse_rounds():
     return cfg.DEFAULT_ROUNDS
 
 
+def strip_rounds_args():
+    """从 sys.argv 剥离 --rounds/-n，避免 airtest 的 cli_setup 解析到未知参数报错"""
+    out = []
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--rounds="):
+            i += 1
+        elif a in ("--rounds", "-n") and i + 1 < len(args):
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    sys.argv = [sys.argv[0]] + out
+
+
 def print_summary():
     total = STATS["success"] + STATS["skip"] + STATS["fail"]
     print("")
@@ -227,9 +316,10 @@ def print_summary():
 
 
 def main():
+    rounds = parse_rounds()      # 先解析轮次参数
+    strip_rounds_args()          # 再剥离，防止 airtest cli_setup 报 unrecognized arguments
     _init()
 
-    rounds = parse_rounds()
     global _consecutive_fail
 
     w, h = get_resolution()
