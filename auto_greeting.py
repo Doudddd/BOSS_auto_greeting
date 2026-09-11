@@ -172,8 +172,15 @@ def match_blacklist(screen):
         rois = [cfg.ROI_JOB_TITLE, cfg.ROI_COMPANY, cfg.ROI_HR_CARD]
 
     texts = []
+    merged = []
     for roi in rois:
-        texts.extend(ENGINE.texts(screen, roi))
+        roi_texts = ENGINE.texts(screen, roi)
+        texts.extend(roi_texts)
+        # 中英混排常被 OCR 拆成多个检测框（「DFX」+「测试」），单框匹配会漏。
+        # 同 ROI 内文本数很少（1~3 条），拼接后再匹配一次代价低、误伤极小。
+        # full_page 文本量大，不拼接，避免跨行造假词。
+        if len(roi_texts) > 1 and cfg.FILTER_SCOPE != "full_page":
+            merged.append("".join(roi_texts))
 
     # 整页模式下先做白名单豁免，避免误伤
     if cfg.FILTER_SCOPE == "full_page":
@@ -182,27 +189,58 @@ def match_blacklist(screen):
             if w in joined:
                 return None
 
+    # 精确匹配列表优先：不参与漏字容错，避免短词被放宽成常见词后误伤
+    # （如「软硬件」经漏字容错会变成「软件」，连目标岗位一起拦掉，见 config 注释）
+    for kw in getattr(cfg, "EXACT_KEYWORDS", []):
+        nk = _norm(kw)
+        if not nk:
+            continue
+        for t in texts + merged:
+            if nk in _norm(t):
+                HIT_DETAIL["kw"], HIT_DETAIL["text"] = kw, t
+                return kw
+
     for kw in cfg.BLACK_KEYWORDS:
-        for t in texts:
+        for t in texts + merged:
             if _kw_hit(kw, t):
                 HIT_DETAIL["kw"], HIT_DETAIL["text"] = kw, t
                 return kw
     return None
 
 
+# OCR 里常见的干扰分隔符：岗位/公司名常被插成「微创软件•hr」「DFX·测试」
+_SEP_CHARS = "·•∙-—_|\u3000"
+
+
+def _norm(s):
+    """归一化：去掉所有空白与常见分隔符 + 转小写
+
+    英文关键词大小写不稳定（DFX / dfx / Dfx），且 OCR 常在英文与中文之间
+    插入空格或「·」，逐条枚举大小写组合不可维护，统一归一化后再匹配。
+    """
+    s = "".join(s.split())
+    for ch in _SEP_CHARS:
+        s = s.replace(ch, "")
+    return s.lower()
+
+
 def _kw_hit(kw, t):
     """关键词是否命中一段 OCR 文本
 
-    除了精确子串，还做「漏字容错」：OCR 经常把「四方精创」识别成「四精创」
-    （2026-09-06 真实事故：因此误发了 2 次沟通）。对长度 >= FUZZY_MIN_LEN 的
-    关键词，删掉任意一个字符后若仍是子串，也算命中。
-    短词（如「硬件」）不做模糊，删一字变单字会误伤一片。
+    ① 归一化（去空白/分隔符/大小写）后做精确子串匹配；
+    ② 「漏字容错」：OCR 经常把「四方精创」识别成「四精创」
+       （2026-09-06 真实事故：因此误发了 2 次沟通）。对长度 >= FUZZY_MIN_LEN 的
+       关键词，删掉任意一个字符后若仍是子串，也算命中。
+       短词（如「硬件」）不做模糊，删一字变单字会误伤一片。
     """
-    if kw in t:
+    nk, nt = _norm(kw), _norm(t)
+    if not nk:
+        return False
+    if nk in nt:
         return True
-    if len(kw) >= cfg.FUZZY_MIN_LEN:
-        for i in range(len(kw)):
-            if (kw[:i] + kw[i + 1:]) in t:
+    if len(nk) >= cfg.FUZZY_MIN_LEN:
+        for i in range(len(nk)):
+            if (nk[:i] + nk[i + 1:]) in nt:
                 return True
     return False
 
@@ -259,7 +297,19 @@ def process_one(n, w, h):
     # ④ 停留等招呼语发出，然后返回
     sleep(cfg.STAY_IN_CHAT + random.uniform(0, 0.8))
     touch(to_px(cfg.BTN_BACK_POS, w, h))
-    if not wait_back_detail(cfg.TIMEOUT_BACK_DETAIL):
+    back_ok = wait_back_detail(cfg.TIMEOUT_BACK_DETAIL)
+
+    # 补按重试：偶发「聊天页 -> 消息列表页」多一层（2026-09-10 第10岗实测），
+    # 一次返回退不到详情页。此时当前页已确认不是详情页（wait_back_detail 已失败），
+    # 再按返回只会往回退一层的层级，比停在中间页继续跑要安全。
+    for i in range(getattr(cfg, "BACK_RETRY", 0)):
+        if back_ok:
+            break
+        print("    [返回重试 %d/%d] 未回到详情页，补按返回键" % (i + 1, cfg.BACK_RETRY))
+        touch(to_px(cfg.BTN_BACK_POS, w, h))
+        back_ok = wait_back_detail(cfg.TIMEOUT_BACK_DETAIL)
+
+    if not back_ok:
         if cfg.SAVE_FAIL_SHOT:
             save_shot(shot(), "fail_noback_%03d" % n)
         return "fail", "返回后未回到详情页"
